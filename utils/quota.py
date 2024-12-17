@@ -13,15 +13,12 @@ quota_lock = threading.Lock()
 MODEL_QUOTAS = {
     "gemini-2.0-flash-exp": {
         "limit_per_min": 10,  # 每分钟限制
-        "requests_per_conversation": 5  # 每次对话消耗的请求数（4个专家 + 1个总结）
     },
     "grok-beta": {
         "limit_per_min": 60,
-        "requests_per_conversation": 5
     },
     "gemini-1.5-flash": {
         "limit_per_min": 10,
-        "requests_per_conversation": 5
     }
 }
 
@@ -146,30 +143,35 @@ def use_quota(model_name):
         return True
 
 
+def calculate_conversation_quota(num_experts):
+    """计算一次对话需要的请求数（专家数量 + 总结）"""
+    return num_experts + 1
+
+
 def get_quota_display(model_name):
     """获取配额显示信息"""
     initialize_quota()
     quota = st.session_state.quota_info[model_name]
     model_config = MODEL_QUOTAS[model_name]
 
+    # 添加安全检查
+    if "experts" not in st.session_state:
+        st.session_state.experts = load_experts()
+
+    num_experts = len(st.session_state.experts)
+    requests_per_conversation = calculate_conversation_quota(num_experts)
+
     with quota_lock:
         now = datetime.now()
 
         # 清理过期请求
-        old_requests = len(quota["requests"])
         quota["requests"] = clean_old_requests(quota.get("requests", []))
-        new_requests = len(quota["requests"])
-
-        if old_requests != new_requests:
-            logger.info(f"🧹 显示时清理了 {old_requests - new_requests} 个过期请求")
-
-        # 计算当前一分钟内的使用情况
         current_requests = len(quota["requests"])
         remaining_requests = model_config["limit_per_min"] - current_requests
 
-        # 计算可进行的对话次数（每次对话需要 requests_per_conversation 个请求）
-        conversations = remaining_requests // model_config["requests_per_conversation"]
-        total_conversations = model_config["limit_per_min"] // model_config["requests_per_conversation"]
+        # 计算可进行的对话次数
+        conversations = remaining_requests // requests_per_conversation
+        total_conversations = model_config["limit_per_min"] // requests_per_conversation
 
         # 如果有请求记录，显示最早请求的重置时间
         if quota["requests"]:
@@ -199,7 +201,7 @@ def get_quota_display(model_name):
             "time_text": time_text,
             "progress": conversations / total_conversations if total_conversations > 0 else 0,
             "current_rpm": current_requests,
-            "requests_per_conversation": model_config["requests_per_conversation"],
-            "requests": quota["requests"],  # 添加请求列表
-            "oldest_request_time": oldest_request_time  # 添加最早请求时间
+            "requests_per_conversation": requests_per_conversation,  # 动态计算的请求数
+            "requests": quota["requests"],
+            "oldest_request_time": oldest_request_time
         }

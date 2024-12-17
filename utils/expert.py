@@ -239,27 +239,10 @@ async def get_responses_async(experts, prompt):
     total_experts = len(experts)
     current_model = st.session_state.current_model
 
-    # 配额检查和扣除的日志
+    # 配额检查和日志记录（但不阻止请求）
     quota_info = get_quota_display(current_model)
     logger.info(f"当前配额状态: 剩余={quota_info['remaining']}, "
                 f"重置时间={quota_info['time_text']}")
-
-    if quota_info['remaining'] <= 0:
-        logger.warning("配额已用完，无法处理请求")
-        for expert in experts:
-            yield expert, f"配额已用完，请等待重置（{quota_info['time_text']}）"
-        return
-
-    # 预扣配额
-    total_requests = total_experts + 1
-    logger.info(f"预扣配额数量: {total_requests} (专家数量 + 总结)")
-
-    for _ in range(total_requests):
-        if not use_quota(current_model):
-            logger.warning("配额不足，无法完成所有请求")
-            for expert in experts:
-                yield expert, "配额不足，无法处理所有专家的回应"
-            return
 
     async def get_expert_response(expert):
         """获取单个专家的回应"""

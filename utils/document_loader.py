@@ -141,3 +141,17 @@ def load_experts():
         logger.error(f"加载专家数据时出错: {str(e)}")
 
     return experts
+
+
+def get_file_type(file_path):
+    """获取文件类型"""
+    # 使用文件扩展名来判断类型
+    extension = os.path.splitext(file_path)[1].lower()
+    if extension in ['.txt', '.md']:
+        return 'text'
+    elif extension in ['.pdf']:
+        return 'pdf'
+    elif extension in ['.doc', '.docx']:
+        return 'word'
+    else:
+        return 'unknown'

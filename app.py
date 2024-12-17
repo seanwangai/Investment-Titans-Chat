@@ -6,7 +6,8 @@ from utils.quota import (
     use_quota,
     get_quota_display,
     initialize_quota,
-    MODEL_QUOTAS
+    MODEL_QUOTAS,
+    calculate_conversation_quota
 )
 from utils.document_loader import load_experts
 import os
@@ -247,11 +248,20 @@ def display_chat_history():
             expert_color = st.session_state.expert_colors.get(
                 message["role"], "#F0F0F0")
             with st.chat_message(message["role"], avatar=message.get("avatar")):
+                # 清理消息内容中的HTML标签
+                content = message["content"]
+                content = content.replace('</div>', '')
+                content = content.replace('<div>', '')
+                content = content.replace('<code>', '')
+                content = content.replace('</code>', '')
+                content = content.replace('<span>', '')
+                content = content.replace('</span>', '')
+
                 st.markdown(
                     f"""<div style="background-color: {expert_color};" class="chat-message">
                         <div class="expert-name">{message["role"]}</div>
                         <div class="divider"></div>
-                        {message["content"].replace('</div>', '').replace('<div>', '')}
+                        {content}
                     </div>""".strip(),
                     unsafe_allow_html=True
                 )
@@ -259,60 +269,96 @@ def display_chat_history():
 
 def display_experts_gallery():
     """显示所有专家的画廊"""
+    st.markdown("""
+        <style>
+        .expert-avatar img {
+            background: transparent !important;
+        }
+        .expert-card {
+            transition: transform 0.2s;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        .expert-card:hover {
+            transform: scale(1.05);
+            box-shadow: 0 8px 16px rgba(0,0,0,0.2);
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
     st.markdown("### 🎯 Titans")
 
-    # 对专家进行排序：英文名字优先
+    # 对专家进行排序
     def sort_key(expert):
-        # Warren Buffett 永远排在第一位
         if expert.name.lower() == "warren buffett":
             return (0, "")
-        # 检查名字是否以英文字母开头
         return (1 if not expert.name[0].isascii() else 0, expert.name.lower())
 
     sorted_experts = sorted(st.session_state.experts, key=sort_key)
+    total_experts = len(sorted_experts)
 
-    # 使用列布局来展示专家
-    cols = st.columns(4)  # 每行4个专家
+    # 计算布局
+    max_per_row = 6
+    num_rows = (total_experts + max_per_row - 1) // max_per_row  # 向上取整
 
-    for idx, expert in enumerate(sorted_experts):
-        with cols[idx % 4]:
-            expert_color = st.session_state.expert_colors.get(
-                expert.name, "#F0F0F0")
-            st.markdown(
-                f"""
-                <div style="
-                    background-color: {expert_color};
-                    padding: 30px;
-                    border-radius: 20px;
-                    text-align: center;
-                    margin: 15px 5px;
-                    color: #1A1A1A;
-                ">
-                    <div style="
-                        width: 150px;
-                        height: 150px;
-                        margin: 0 auto;
-                        border-radius: 75px;
-                        overflow: hidden;
-                        background-color: white;
-                        border: 3px solid rgba(0,0,0,0.1);
-                        class="expert-avatar"
+    # 为每行创建列
+    for row in range(num_rows):
+        # 计算当前行的专家数量
+        start_idx = row * max_per_row
+        end_idx = min(start_idx + max_per_row, total_experts)
+        experts_in_row = sorted_experts[start_idx:end_idx]
+        num_experts_in_row = len(experts_in_row)
+
+        # 创建列
+        cols = st.columns(num_experts_in_row)
+
+        # 在每列中显示专家
+        for col, expert in zip(cols, experts_in_row):
+            with col:
+                expert_color = st.session_state.expert_colors.get(
+                    expert.name, "#F0F0F0")
+                st.markdown(
+                    f"""
+                    <div class="expert-card" style="
+                        background-color: {expert_color};
+                        padding: 20px;
+                        border-radius: 20px;
+                        text-align: center;
+                        margin: 10px 5px;
+                        color: #1A1A1A;
+                        height: 100%;
                     ">
-                        <img src="{expert.avatar if expert.avatar.startswith('data:') else ''}" 
-                             style="width: 100%; height: 100%; object-fit: cover;"
-                             onerror="this.style.backgroundColor='white'; this.innerHTML='{expert.avatar}'">
+                        <div style="
+                            width: 100%;
+                            padding-bottom: 100%;
+                            position: relative;
+                            margin-bottom: 15px;
+                        ">
+                            <div class="expert-avatar" style="
+                                position: absolute;
+                                top: 0;
+                                left: 0;
+                                right: 0;
+                                bottom: 0;
+                                overflow: hidden;
+                                background-color: transparent;
+                            ">
+                                <img src="{expert.avatar if expert.avatar.startswith('data:') else ''}" 
+                                     style="width: 100%; height: 100%; object-fit: contain; background: transparent;"
+                                     onerror="this.style.backgroundColor='transparent';">
+                            </div>
+                        </div>
+                        <div style="
+                            font-size: 1.2vw;
+                            font-weight: bold;
+                            margin-top: 10px;
+                            word-wrap: break-word;
+                        ">
+                            {expert.name}
+                        </div>
                     </div>
-                    <div style="
-                        font-size: 24px;
-                        font-weight: bold;
-                        margin-top: 15px;
-                    ">
-                        {expert.name}
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
+                    """,
+                    unsafe_allow_html=True
+                )
 
 
 def add_auto_scroll():
@@ -435,11 +481,11 @@ def display_quota_info():
                 0, int((reset_time - datetime.now()).total_seconds()))
             time_display = f"""<span class="quota-time" data-reset-time="{reset_time.isoformat()}">{time_left}秒后重置一个配额</span>"""
         else:
-            time_display = """<span class="quota-time">每分钟重置</span>"""
+            time_display = """<span class="quota-time">每60秒重置</span>"""
 
         quota_container.markdown(
             f"""<div style="text-align: right; font-size: 0.8em;">
-                剩余问题数: {quota_info['remaining']}/{quota_info['limit']}<br>
+                每分鐘问题数: {quota_info['remaining']}/{quota_info['limit']}<br>
                 {time_display}
             </div>""",
             unsafe_allow_html=True
@@ -447,9 +493,11 @@ def display_quota_info():
 
 
 def main():
-    # 使用新的配额显示器替换原来的标题和模型选择器
-    display_quota_info()
+    # 先初始化会话状态
     initialize_session_state()
+
+    # 再显示配额信息
+    display_quota_info()
 
     # 显示专家画廊
     display_experts_gallery()
@@ -458,25 +506,24 @@ def main():
 
     # 用户输入
     if user_input := st.chat_input("Share your thesis for analysis..."):
-        # 添加用户消息到历史记录
+        # 添加用户消息到历史记录并显示
         st.session_state.messages.append({
             "role": "user",
             "content": user_input
         })
 
-        # 显示用户消息并立即滚动
+        # 显示用户消息
         with st.chat_message("user"):
             st.write(user_input)
-            add_auto_scroll()  # 用户输入后立即滚动
+            add_auto_scroll()
 
         current_model = st.session_state.current_model
         total_experts = len(st.session_state.experts)
-        required_quota = total_experts + 1  # 专家数量 + 总结
+        required_quota = calculate_conversation_quota(total_experts)
 
-        # 在处理前检查配额
-        logger.info(f"准备处理新问题，需要配额: {required_quota}")
+        logger.info(f"当前专家数量: {total_experts}, 需要配额: {required_quota}")
 
-        # 检查是否有足够的配额
+        # 检查配额并显示警告（但不阻止请求）
         if not check_quota(current_model, required_quota):
             quota_info = get_quota_display(current_model)
 
@@ -497,7 +544,7 @@ def main():
 - 需要 {required_quota} 个配额，当前剩余 {quota_info['remaining']} 个"""
 
             st.warning(warning_message)
-            add_auto_scroll()  # 显示警告后滚动
+            add_auto_scroll()
 
             # 显示其他可用模型的建议
             available_models = []
@@ -509,17 +556,13 @@ def main():
 
             if available_models:
                 st.info("💡 以下模型当前可用：\n" + "\n".join(available_models))
-                add_auto_scroll()  # 显示可用模型后滚动
+                add_auto_scroll()
 
-            return
-
-        # 预先扣除所有需要的配额
+        # 记录配额使用（不管是否超限）
         for _ in range(required_quota):
-            if not use_quota(current_model):
-                st.warning("配额扣除异常，请稍后重试")
-                return
+            use_quota(current_model)
 
-        logger.info(f"成功预扣 {required_quota} 个配额")
+        logger.info(f"记录配额使用：{required_quota} 个（专家: {total_experts}, 总结: 1）")
 
         # 对专家进行排序
         def sort_key(expert):
