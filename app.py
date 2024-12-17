@@ -1,10 +1,20 @@
 import random
 import streamlit as st
 from utils.expert import ExpertAgent, get_responses_async, generate_summary
+from utils.quota import (
+    check_quota,
+    use_quota,
+    get_quota_display,
+    initialize_quota,
+    MODEL_QUOTAS
+)
 from utils.document_loader import load_experts
 import os
 import asyncio
 import logging
+from utils.dropbox_handler import download_and_extract_dropbox
+from datetime import datetime, timedelta
+import time
 
 # 设置日志
 logger = logging.getLogger(__name__)
@@ -32,49 +42,56 @@ st.set_page_config(
 # 自定义 CSS 样式
 st.markdown("""
     <style>
-    /* 覆盖 Streamlit 默认的头像样式 */
-    .st-emotion-cache-1v0mbdj > img,
-    .st-emotion-cache-1v0mbdj > svg {
-        width: 200px !important;
-        height: 200px !important;
-        border-radius: 100px !important;
-        object-fit: cover !important;
-        background-color: white !important;
-        border: 3px solid rgba(0,0,0,0.1) !important;
-        box-shadow: 0 4px 8px rgba(0,0,0,0.1) !important;
+    /* 聊天消息容器样式 */
+    .stChatMessage {
+        display: flex !important;
+        align-items: flex-start !important;
+        gap: 1rem !important;
+        padding: 1rem !important;
+        margin-bottom: 1rem !important;
     }
     
-    /* 调整对话消息中的头像大小 */
-    .st-emotion-cache-p4micv {
+    /* 头像样式 */
+    .stChatMessage > img,
+    .stChatMessage > svg {
         width: 10rem !important;
         height: 10rem !important;
-    }
-    
-    /* 确保头像内的图片也跟随调整 */
-    .st-emotion-cache-p4micv > img,
-    .st-emotion-cache-p4micv > svg {
-        width: 100% !important;
-        height: 100% !important;
+        border-radius: 5rem !important;
         object-fit: cover !important;
+        flex-shrink: 0 !important;
     }
     
-    /* 适应深色主题 */
+    /* 消息内容样式 */
+    .stChatMessage > div:last-child {
+        flex-grow: 1 !important;
+        min-width: 0 !important;
+        margin-left: 1rem !important;
+    }
+    
+    /* 确保聊天容器可以滚动 */
+    .stChatMessageContainer {
+        overflow-y: auto !important;
+        max-height: calc(100vh - 200px) !important;
+        scroll-behavior: smooth !important;
+    }
+    
+    /* 调整消息框样式 */
     .chat-message {
         padding: 20px !important;
         border-radius: 15px !important;
-        margin: 10px 0 !important;
-        color: #1A1A1A !important;  /* 深色文字 */
+        margin: 0 !important;
+        width: 100% !important;
+        box-sizing: border-box !important;
     }
     
-    /* 放大专家名字 */
+    /* 专家名字样式 */
     .expert-name {
-        font-size: 28px !important;
+        font-size: 24px !important;
         font-weight: bold !important;
         margin-bottom: 10px !important;
-        color: #1A1A1A !important;  /* 深色文字 */
     }
     
-    /* 美化分隔线 */
+    /* 分隔线样式 */
     .divider {
         margin: 10px 0 !important;
         border: none !important;
@@ -82,53 +99,35 @@ st.markdown("""
         background: linear-gradient(to right, rgba(0,0,0,0.1), rgba(0,0,0,0.3), rgba(0,0,0,0.1)) !important;
     }
     
-    /* Titans 特殊样式 */
-    .masters-message {
-        background: linear-gradient(135deg, #f6d365 0%, #fda085 100%) !important;
-        border: 2px solid #f6d365 !important;
+    /* 用户消息特殊样式 */
+    .stChatMessage[data-testid="chat-message-user"] {
+        justify-content: flex-end !important;
     }
     
-    /* 专家画廊头像样式 */
-    .expert-avatar {
-        background-color: white !important;
-        box-shadow: 0 4px 8px rgba(0,0,0,0.1) !important;
+    /* Streamlit 默认样式覆盖 */
+    .st-emotion-cache-1v0mbdj > img,
+    .st-emotion-cache-1v0mbdj > svg {
+        width: 10rem !important;
+        height: 10rem !important;
+        border-radius: 5rem !important;
     }
     
-    /* 确保深色主题下的文字可见性 */
-    [data-theme="dark"] .chat-message,
-    [data-theme="dark"] .expert-name {
-        color: #1A1A1A !important;
-    }
-    
-    /* 调整底部输入区域 */
-    .stBottomBlockContainer {
-        padding: 0 !important;
-        margin: 0 !important;
-    }
-    
-    /* 调整输入框样式 */
-    .stTextArea textarea {
-        height: 100px !important;
-        font-size: 1.1rem !important;
+    /* 输入框容器样式 */
+    .stChatInputContainer {
         padding: 1rem !important;
-        border-radius: 15px !important;
+        background: white !important;
+        position: sticky !important;
+        bottom: 0 !important;
+        z-index: 100 !important;
     }
     
-    /* 调整输入区域的提示文字 */
-    .stTextArea label {
-        font-size: 1.1rem !important;
-        font-weight: 500 !important;
-        margin: 0 !important;
-        padding: 0 !important;
+    /* 确保主容器正确显示 */
+    .main.css-uf99v8.ea3mdgi5 {
+        overflow-y: auto !important;
+        scroll-behavior: smooth !important;
     }
     
-    /* 移除底部区域的额外空间 */
-    .stBottomBlockContainer > div {
-        margin: 0 !important;
-        padding: 0 !important;
-    }
-    
-    /* 思考中动画 */
+    /* 思考动画样式保持不变 */
     .thinking-animation {
         font-style: italic;
         color: #666;
@@ -167,17 +166,76 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 
+def add_model_selector():
+    """添加模型选择器"""
+    models = {
+        "Grok": "grok-beta",
+        "Gemini": "gemini-1.5-flash"
+    }
+
+    # 在右上角添加模型选择器
+    with st.sidebar:
+        selected_model = st.selectbox(
+            "选择模型",
+            options=list(models.keys()),
+            format_func=lambda x: x,
+            key="model_selector"
+        )
+        st.session_state.current_model = models[selected_model]
+
+
+def get_expert_color(expert_name, index):
+    """根据专家名称和索引生成颜色"""
+    # 预定义的柔和色彩列表
+    colors = [
+        "#FFE4E1",  # 浅玫瑰色
+        "#E0FFFF",  # 浅青色
+        "#F0FFF0",  # 蜜瓜色
+        "#FFF0F5",  # 浅紫色
+        "#F5F5DC",  # 米色
+        "#F0F8FF",  # 爱丽丝蓝
+        "#FAFAD2",  # 浅金菊黄
+        "#E6E6FA",  # 淡紫色
+        "#F5F5F5",  # 白烟色
+        "#E8F4F8",  # 浅蓝灰色
+    ]
+
+    # 为 Investment Masters Summary 保留特定颜色
+    if expert_name == "Investment Masters Summary":
+        return "#f6d365"
+
+    # 使用索引循环选择颜色
+    return colors[index % len(colors)]
+
+
 def initialize_session_state():
     if "messages" not in st.session_state:
         st.session_state.messages = []
     if "experts" not in st.session_state:
         st.session_state.experts = load_experts()
-        # 为每个专家分配一个固定的背景颜色
-        if "expert_colors" not in st.session_state:
-            st.session_state.expert_colors = {
-                expert.name: color
-                for expert, color in zip(st.session_state.experts, EXPERT_COLORS)
-            }
+    if "expert_colors" not in st.session_state:
+        # 动态为每个专家分配颜色
+        st.session_state.expert_colors = {
+            expert.name: get_expert_color(expert.name, idx)
+            for idx, expert in enumerate(st.session_state.experts)
+        }
+        # 添加总结专家的颜色
+        st.session_state.expert_colors["Investment Masters Summary"] = "#f6d365"
+    if "current_model" not in st.session_state:
+        st.session_state.current_model = "gemini-2.0-flash-exp"  # 默认使用 Gemini 2.0
+    if "quota_info" not in st.session_state:
+        st.session_state.quota_info = {
+            "gemini-2.0-flash-exp": {"limit": 10, "remaining": 10, "reset_time": None},
+            "grok-beta": {"limit": 60, "remaining": 60, "reset_time": None},
+            "gemini-1.5-flash": {"limit": 10, "remaining": 10, "reset_time": None}
+        }
+    # 添加总结专家到会话状态
+    if "titans" not in st.session_state:
+        st.session_state.titans = ExpertAgent(
+            name="Investment Masters",
+            knowledge_base="",  # 不需要知识库
+            avatar="masters_logo.png"  # 使用logo作为头像
+        )
 
 
 def display_chat_history():
@@ -190,13 +248,11 @@ def display_chat_history():
                 message["role"], "#F0F0F0")
             with st.chat_message(message["role"], avatar=message.get("avatar")):
                 st.markdown(
-                    f"""
-                    <div style="background-color: {expert_color};" class="chat-message">
+                    f"""<div style="background-color: {expert_color};" class="chat-message">
                         <div class="expert-name">{message["role"]}</div>
                         <div class="divider"></div>
-                        {message["content"]}
-                    </div>
-                    """,
+                        {message["content"].replace('</div>', '').replace('<div>', '')}
+                    </div>""".strip(),
                     unsafe_allow_html=True
                 )
 
@@ -259,73 +315,229 @@ def display_experts_gallery():
             )
 
 
-def main():
-    st.title("Investment Titans Chat")
+def add_auto_scroll():
+    """添加自动滚动 JavaScript"""
+    st.markdown("""
+        <script>
+            function scrollToBottom() {
+                // 立即滚动整个页面
+                window.scrollTo({
+                    top: document.body.scrollHeight,
+                    behavior: 'smooth'
+                });
+                
+                // 滚动所有可能的容器
+                const containers = [
+                    '.stChatMessageContainer',
+                    '.main.css-uf99v8.ea3mdgi5',
+                    '.st-emotion-cache-1v0mbdj',
+                    '.element-container'
+                ];
+                
+                containers.forEach(selector => {
+                    const elements = document.querySelectorAll(selector);
+                    elements.forEach(element => {
+                        element.scrollTop = element.scrollHeight;
+                    });
+                });
+            }
 
-    initialize_session_state()
+            // 立即执行
+            scrollToBottom();
+            
+            // 延迟执行几次以确保内容加载
+            [100, 300, 500, 1000].forEach(delay => {
+                setTimeout(scrollToBottom, delay);
+            });
 
-    # 对专家进行排序：英文名字优先
-    def sort_key(expert):
-        # Warren Buffett 永远排在第一位
-        if expert.name.lower() == "warren buffett":
-            return (0, "")
-        # 检查名字是否以英文字母开头
-        return (1 if not expert.name[0].isascii() else 0, expert.name.lower())
+            // 创建观察器
+            const observer = new MutationObserver((mutations) => {
+                mutations.forEach((mutation) => {
+                    if (mutation.addedNodes.length || mutation.type === 'childList') {
+                        scrollToBottom();
+                    }
+                });
+            });
 
-    sorted_experts = sorted(st.session_state.experts, key=sort_key)
+            // 观察整个文档的变化
+            observer.observe(document.body, {
+                childList: true,
+                subtree: true,
+                attributes: true
+            });
+        </script>
+    """, unsafe_allow_html=True)
 
-    # 添加总结专家到专家列表
-    if "titans" not in st.session_state:
-        st.session_state.titans = ExpertAgent(
-            name="Investment Masters",
-            knowledge_base="",  # 不需要知识库
-            avatar="masters_logo.png"  # 使用logo作为头像
+
+def display_quota_info():
+    """显示API配额信息"""
+    col1, col2, col3 = st.columns([3, 1, 1])
+
+    with col1:
+        st.title("Investment Titans Chat")
+
+    with col2:
+        # 添加模型选择器
+        models = {
+            "Gemini 2.0": {"name": "gemini-2.0-flash-exp", "limit": 10},
+            "Grok": {"name": "grok-beta", "limit": 60},
+            "Gemini 1.5": {"name": "gemini-1.5-flash", "limit": 15}
+        }
+        selected_model = st.selectbox(
+            "选择模型",
+            options=list(models.keys()),
+            format_func=lambda x: x,
+            key="model_selector",
+            index=0
         )
+        model_info = models[selected_model]
+        st.session_state.current_model = model_info["name"]
+
+    with col3:
+        # 使用 st.empty() 创建一个容器
+        quota_container = st.empty()
+
+        # 获取配额信息
+        quota_info = get_quota_display(st.session_state.current_model)
+
+        # 添加自动刷新脚本
+        st.markdown("""
+            <script>
+                function updateQuotaDisplay() {
+                    const now = new Date();
+                    const quotaElements = document.querySelectorAll('.quota-time');
+                    quotaElements.forEach(element => {
+                        const resetTime = new Date(element.getAttribute('data-reset-time'));
+                        const timeLeft = Math.max(0, Math.floor((resetTime - now) / 1000));
+                        if (timeLeft > 0) {
+                            element.textContent = `${timeLeft}秒后重置一个配额`;
+                        } else {
+                            element.textContent = '每分钟重置';
+                        }
+                    });
+                }
+                
+                // 每秒更新一次
+                setInterval(updateQuotaDisplay, 1000);
+                
+                // 每5秒重新加载页面以获取最新配额
+                setInterval(() => {
+                    window.parent.document.querySelector('iframe').contentWindow.location.reload();
+                }, 5000);
+            </script>
+        """, unsafe_allow_html=True)
+
+        # 显示配额信息
+        if quota_info["requests"] and quota_info["oldest_request_time"]:
+            reset_time = quota_info["oldest_request_time"] + \
+                timedelta(minutes=1)
+            time_left = max(
+                0, int((reset_time - datetime.now()).total_seconds()))
+            time_display = f"""<span class="quota-time" data-reset-time="{reset_time.isoformat()}">{time_left}秒后重置一个配额</span>"""
+        else:
+            time_display = """<span class="quota-time">每分钟重置</span>"""
+
+        quota_container.markdown(
+            f"""<div style="text-align: right; font-size: 0.8em;">
+                剩余问题数: {quota_info['remaining']}/{quota_info['limit']}<br>
+                {time_display}
+            </div>""",
+            unsafe_allow_html=True
+        )
+
+
+def main():
+    # 使用新的配额显示器替换原来的标题和模型选择器
+    display_quota_info()
+    initialize_session_state()
 
     # 显示专家画廊
     display_experts_gallery()
-
-    # 添加分隔线
     st.markdown("---")
-
-    # 显示聊天历史
     display_chat_history()
 
     # 用户输入
     if user_input := st.chat_input("Share your thesis for analysis..."):
+        # 添加用户消息到历史记录
+        st.session_state.messages.append({
+            "role": "user",
+            "content": user_input
+        })
+
+        # 显示用户消息并立即滚动
+        with st.chat_message("user"):
+            st.write(user_input)
+            add_auto_scroll()  # 用户输入后立即滚动
+
+        current_model = st.session_state.current_model
+        total_experts = len(st.session_state.experts)
+        required_quota = total_experts + 1  # 专家数量 + 总结
+
+        # 在处理前检查配额
+        logger.info(f"准备处理新问题，需要配额: {required_quota}")
+
+        # 检查是否有足够的配额
+        if not check_quota(current_model, required_quota):
+            quota_info = get_quota_display(current_model)
+
+            # 获取下一个配额重置的时间
+            if quota_info["oldest_request_time"]:
+                reset_time = quota_info["oldest_request_time"] + \
+                    timedelta(minutes=1)
+                time_left = max(
+                    0, int((reset_time - datetime.now()).total_seconds()))
+                warning_message = f"""⚠️ 已超出每分钟问答限制
+- 等待 {time_left} 秒后将重置一个配额
+- 或切换到其他模型继续对话
+- 需要 {required_quota} 个配额，当前剩余 {quota_info['remaining']} 个"""
+            else:
+                warning_message = f"""⚠️ 已超出每分钟问答限制
+- 请等待配额重置后再试
+- 或切换到其他模型继续对话
+- 需要 {required_quota} 个配额，当前剩余 {quota_info['remaining']} 个"""
+
+            st.warning(warning_message)
+            add_auto_scroll()  # 显示警告后滚动
+
+            # 显示其他可用模型的建议
+            available_models = []
+            for model_name in MODEL_QUOTAS:
+                if model_name != current_model and check_quota(model_name, required_quota):
+                    model_info = get_quota_display(model_name)
+                    available_models.append(
+                        f"- {model_name}: 剩余 {model_info['remaining']} 次对话")
+
+            if available_models:
+                st.info("💡 以下模型当前可用：\n" + "\n".join(available_models))
+                add_auto_scroll()  # 显示可用模型后滚动
+
+            return
+
+        # 预先扣除所有需要的配额
+        for _ in range(required_quota):
+            if not use_quota(current_model):
+                st.warning("配额扣除异常，请稍后重试")
+                return
+
+        logger.info(f"成功预扣 {required_quota} 个配额")
+
+        # 对专家进行排序
+        def sort_key(expert):
+            if expert.name.lower() == "warren buffett":
+                return (0, "")
+            return (1 if not expert.name[0].isascii() else 0, expert.name.lower())
+
+        sorted_experts = sorted(st.session_state.experts, key=sort_key)
+
         # 构建完整的提示词
-        prompt = f"""你看完我以下的thesis後，你會提出什麼問題，說出thesis裡不夠深入需要加強的？並以說出你過去的經驗，要怎樣才能投資，提出一個解決方案。以關鍵問題group： 
+        prompt = f"""你看完我以下的thesis後，你會提出什麼問題，說出thesis裡不夠深入需要加強的？並以說出你過去的經驗，要怎樣才能投資，提出一個解決方案。以關鍵問題group：  （如果沒有輸入thesis就根據先前閱讀的資料純聊天就好）
 
 {user_input}"""
 
         try:
-            # 添加用户消息
-            st.session_state.messages.append({
-                "role": "user",
-                "content": user_input  # 保存原始输入，不包含提示词
-            })
-
-            # 显示用户消息
-            with st.chat_message("user"):
-                st.write(user_input)  # 显示原始输入，不包含提示词
-
-            # 添加自动滚动 JavaScript
-            st.markdown("""
-                <script>
-                    function scroll() {
-                        var elements = window.parent.document.getElementsByClassName('stChatMessage');
-                        if (elements.length > 0) {
-                            var lastElement = elements[elements.length - 1];
-                            lastElement.scrollIntoView({ behavior: 'smooth' });
-                        }
-                    }
-                    setTimeout(scroll, 100);
-                </script>
-                """, unsafe_allow_html=True)
-
             # 创建占位符
             response_placeholders = {}
-            for expert in st.session_state.experts:
+            for expert in sorted_experts:  # 使用排序后的专家列表
                 expert_color = st.session_state.expert_colors.get(
                     expert.name, "#F0F0F0")
                 with st.chat_message(expert.name, avatar=expert.avatar):
@@ -373,44 +585,35 @@ def main():
 
             # 异步获取和显示回答
             responses = []
+            final_sorted_experts = sorted_experts  # 保存排序后的专家列表供异步函数使用
 
             # 创建新的事件循环
             async def run_async():
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 try:
-                    await process_responses()
+                    await process_responses(final_sorted_experts)  # 传入排序后的专家列表
                 finally:
                     loop.close()
 
-            async def process_responses():
-                async for expert, response in get_responses_async(st.session_state.experts, prompt):
+            async def process_responses(sorted_experts):  # 接收排序后的专家列表作为参数
+                responses = []
+                experts_responded = set()
+
+                # 使用排序后的专家列表
+                async for expert, response in get_responses_async(sorted_experts, prompt):
                     expert_color = st.session_state.expert_colors.get(
                         expert.name, "#F0F0F0")
                     # 更新对应专家的占位符
                     response_placeholders[expert.name].markdown(
-                        f"""
-                        <div style="background-color: {expert_color};" class="chat-message">
+                        f"""<div style="background-color: {expert_color};" class="chat-message">
                             <div class="expert-name">{expert.name}</div>
                             <div class="divider"></div>
-                            {response}
-                        </div>
-                        """,
+                            {response.replace('</div>', '').replace('<div>', '')}
+                        </div>""".strip(),
                         unsafe_allow_html=True
                     )
-                    # 每次更新后添加滚动
-                    st.markdown("""
-                        <script>
-                            function scroll() {
-                                var elements = window.parent.document.getElementsByClassName('stChatMessage');
-                                if (elements.length > 0) {
-                                    var lastElement = elements[elements.length - 1];
-                                    lastElement.scrollIntoView({ behavior: 'smooth' });
-                                }
-                            }
-                            setTimeout(scroll, 100);
-                        </script>
-                        """, unsafe_allow_html=True)
+                    add_auto_scroll()
 
                     # 保存到会话状态
                     st.session_state.messages.append({
@@ -419,38 +622,25 @@ def main():
                         "avatar": expert.avatar
                     })
                     responses.append(response)
+                    experts_responded.add(expert.name)
 
-                    # 如果有足够的回答，生成总结
-                    if len(responses) >= 2:  # 至少有两个专家回答后就开始生成总结
+                    # 只有在所有专家都回答完后才生成总结
+                    if len(experts_responded) == len(sorted_experts):
                         try:
                             titans_response = await generate_summary(
                                 prompt,
                                 responses,
-                                sorted_experts[:len(responses)]  # 使用已排序的专家列表
+                                sorted_experts  # 使用所有专家
                             )
                             titans_placeholder.markdown(
-                                f"""
-                                <div style="background-color: #f6d365;" class="chat-message masters-message">
+                                f"""<div style="background-color: #f6d365;" class="chat-message masters-message">
                                     <div class="expert-name">Investment Masters Summary</div>
                                     <div class="divider"></div>
-                                    {titans_response}
-                                </div>
-                                """,
+                                    {titans_response.replace('</div>', '').replace('<div>', '')}
+                                </div>""".strip(),
                                 unsafe_allow_html=True
                             )
-                            # 总结更新后也添加滚动
-                            st.markdown("""
-                                <script>
-                                    function scroll() {
-                                        var elements = window.parent.document.getElementsByClassName('stChatMessage');
-                                        if (elements.length > 0) {
-                                            var lastElement = elements[elements.length - 1];
-                                            lastElement.scrollIntoView({ behavior: 'smooth' });
-                                        }
-                                    }
-                                    setTimeout(scroll, 100);
-                                </script>
-                                """, unsafe_allow_html=True)
+                            add_auto_scroll()
                         except Exception as e:
                             logger.error(f"生成总结时出错: {str(e)}")
                             titans_placeholder.markdown(
@@ -473,6 +663,22 @@ def main():
         except Exception as e:
             st.error(f"处理请求时发生错误: {str(e)}")
             logger.error(f"处理请求时发生错误: {str(e)}", exc_info=True)
+
+
+# 在应用启动时下载并解压文件
+@st.cache_resource
+def initialize_data():
+    dropbox_url = st.secrets["DROPBOX_DATA_URL"]
+    success = download_and_extract_dropbox(dropbox_url)
+    if not success:
+        st.error("无法从Dropbox下载数据")
+    return success
+
+
+# 在应用的主要部分调用这个函数
+if initialize_data():
+    # 继续应用的其他逻辑
+    pass
 
 
 if __name__ == "__main__":

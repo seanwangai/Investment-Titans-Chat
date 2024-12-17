@@ -1,3 +1,4 @@
+from utils.quota import check_quota, use_quota, get_quota_display  # 使用新的函数名
 from openai import OpenAI
 from openai import APIError, APIConnectionError, RateLimitError, APITimeoutError
 import logging
@@ -7,6 +8,19 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import streamlit as st
 import backoff  # 添加到导入列表
+from datetime import datetime
+import sys
+import os
+
+# 添加项目根目录到 Python 路径
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# 在文件开头添加更详细的日志格式设置
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
 # X-AI API 配置
 client = OpenAI(
@@ -182,18 +196,20 @@ class ExpertAgent:
         max_tries=3,
         max_time=30
     )
-    def get_response(self, prompt):
+    async def get_response(self, prompt):
         """获取专家回应"""
         try:
+            logger.info(f"开始处理专家 {self.name} 的回应")
+            logger.info(f"输入问题: {prompt[:100]}...")  # 只显示前100个字符
+
             # 等待速率限制
             rate_limiter.wait()
 
-            # 计算当前系统提示的 tokens
             system_prompt = self.get_system_prompt()
             system_tokens = self.count_tokens(system_prompt)
             prompt_tokens = self.count_tokens(prompt)
 
-            logger.info(f"当前请求 tokens 统计：系统={system_tokens}, "
+            logger.info(f"{self.name} - Tokens统计：系统={system_tokens}, "
                         f"问题={prompt_tokens}, 历史={self.history_tokens}")
 
             response = client.chat.completions.create(
@@ -204,87 +220,99 @@ class ExpertAgent:
                 ],
                 temperature=0.7
             )
+
             answer = response.choices[0].message.content
+            logger.info(f"{self.name} 的回应: {answer[:200]}...")  # 只显示前200个字符
+
             self.update_chat_history(prompt, answer)
             return answer
 
-        except APIConnectionError as e:
-            error_msg = f"连接到 API 服务器失败: {str(e)}\n详细信息: {e.__dict__}"
-            logger.error(error_msg)
-            return "🔌 Connection lost... Let me try to reconnect and get back to you."
-
-        except RateLimitError as e:
-            error_msg = f"触发速率限制: {str(e)}\n详细信息: {e.__dict__}"
-            logger.error(error_msg)
-            return "⏳ The server is quite busy. Please give me a moment to catch up."
-
-        except APITimeoutError as e:
-            error_msg = f"API 请求超时: {str(e)}\n详细信息: {e.__dict__}"
-            logger.error(error_msg)
-            return "⌛ Taking longer than expected... Let me speed things up."
-
-        except APIError as e:
-            error_msg = f"API 错误: {str(e)}\n状态码: {e.status_code}\n响应: {e.response}\n详细信息: {e.__dict__}"
-            logger.error(error_msg)
-            return "🔧 Oops! Something went wrong. I'll fix it and try again."
-
         except Exception as e:
-            error_msg = f"未预期的错误: {str(e)}\n类型: {type(e)}\n详细信息: {e.__dict__}"
-            logger.error(error_msg)
-            return "🎯 Unexpected issue. I'll recalibrate and get back on track."
+            logger.error(f"{self.name} 处理失败: {str(e)}")
+            raise e
 
 
 async def get_responses_async(experts, prompt):
     """异步获取所有专家的回应"""
-    loop = asyncio.get_event_loop()
+    logger.info(f"收到新问题: {prompt}")
+    logger.info(f"开始处理所有专家回应，专家数量: {len(experts)}")
+    total_experts = len(experts)
+    current_model = st.session_state.current_model
 
-    # 记录开始时间
-    start_time = time.time()
+    # 配额检查和扣除的日志
+    quota_info = get_quota_display(current_model)
+    logger.info(f"当前配额状态: 剩余={quota_info['remaining']}, "
+                f"重置时间={quota_info['time_text']}")
 
-    # 创建任务列表，同时保存专家信息
-    tasks_info = []
-    for expert in experts:
-        task = loop.run_in_executor(
-            executor,
-            expert.get_response,
-            prompt
-        )
-        tasks_info.append((expert, task))
+    if quota_info['remaining'] <= 0:
+        logger.warning("配额已用完，无法处理请求")
+        for expert in experts:
+            yield expert, f"配额已用完，请等待重置（{quota_info['time_text']}）"
+        return
 
-    # 使用 as_completed 处理完成的任务
-    pending = [task for _, task in tasks_info]
-    while pending:
-        done, pending = await asyncio.wait(
-            pending, return_when=asyncio.FIRST_COMPLETED)
+    # 预扣配额
+    total_requests = total_experts + 1
+    logger.info(f"预扣配额数量: {total_requests} (专家数量 + 总结)")
 
-        for future in done:
-            try:
-                # 找到对应的专家
-                expert = next(
-                    exp for exp, task in tasks_info if task == future)
-                response = await future
-                yield expert, response
-            except Exception as e:
-                logger.error(f"处理专家响应时出错: {str(e)}")
-                continue
+    for _ in range(total_requests):
+        if not use_quota(current_model):
+            logger.warning("配额不足，无法完成所有请求")
+            for expert in experts:
+                yield expert, "配额不足，无法处理所有专家的回应"
+            return
 
-    # 记录完成时间
-    end_time = time.time()
-    logger.info(f"所有专家回应完成，耗时: {end_time - start_time:.2f} 秒")
+    async def get_expert_response(expert):
+        """获取单个专家的回应"""
+        try:
+            logger.info(f"开始处理 {expert.name} 的回应...")
+            if current_model in ["gemini-2.0-flash-exp", "gemini-1.5-flash"]:
+                from .gemini_handler import generate_gemini_response
+                expert_prompt = f"你现在扮演 {expert.name}。请基于以下投资理念回答问题：\n\n{expert.knowledge_base}\n\n问题：{prompt}"
+                logger.info(
+                    f"发送到 {current_model} 的提示词: {expert_prompt[:200]}...")
+                response = await generate_gemini_response(expert_prompt, current_model)
+            else:
+                response = await expert.get_response(prompt)
+            return expert, response
+        except Exception as e:
+            error_msg = f"专家 {expert.name} 处理失败: {str(e)}"
+            logger.error(error_msg)
+            logger.exception(e)
+            return expert, f"抱歉，生成回应时出现错误: {str(e)}"
+
+    # 并发处理所有专家的请求
+    tasks = [get_expert_response(expert) for expert in experts]
+    responses = await asyncio.gather(*tasks)
+
+    # 按原始顺序返回结果
+    for expert, response in responses:
+        yield expert, response
 
 
 async def generate_summary(prompt, responses, experts):
     """生成总结"""
+    logger.info("开始生成总结...")
+
+    # 动态构建专家回应列表
+    expert_responses = []
+    for expert, response in zip(experts, responses):
+        expert_responses.append(f"{expert.name}：{response}")
+        logger.info(f"整合 {expert.name} 的回应到总结中")
+
     summary_prompt = f"""作为 Investment Masters，你的任务是总结和整合各位投资大师的观点。
 
 以下是各位大师对这个 thesis 的分析和建议：
 
-{chr(10).join([f"{expert.name}：{response}" for expert, response in zip(experts, responses)])}
+{chr(10).join(expert_responses)}
 
 请你：
 1. 总结各位大师发现的主要问题
 2. 归纳他们提出需要多深入研究什麼
+3. 找出专家们的共识和分歧
+4. 提供一个整合的行动建议
 """
+
+    logger.info(f"生成总结的提示词: {summary_prompt[:200]}...")
 
     try:
         summary_response = client.chat.completions.create(
@@ -292,9 +320,19 @@ async def generate_summary(prompt, responses, experts):
             messages=[{"role": "user", "content": summary_prompt}],
             temperature=0.7
         )
-        return summary_response.choices[0].message.content
+        summary = summary_response.choices[0].message.content
+
+#         logger.info(f"""
+# ==================== Investment Masters 总结 ====================
+# {summary}
+# ==========================================================
+# """)
+
+        return summary
     except Exception as e:
-        logger.error(f"生成总结时出错: {str(e)}")
+        error_msg = "生成总结时出错"
+        logger.error(error_msg)
+        logger.exception(e)  # 记录完整的错误堆栈
         return "抱歉，无法生成总结。"
 
 __all__ = ['ExpertAgent', 'get_responses_async', 'generate_summary']

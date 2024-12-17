@@ -6,3 +6,10 @@ PyPDF2
 tiktoken>=0.5.2
 bs4>=0.0.1
 backoff>=2.2.1
+requests>=2.31.0
+python-dotenv
+langchain
+python-magic
+python-magic-bin
+zipfile36
+google-generativeai

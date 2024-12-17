@@ -1,4 +1,4 @@
-# Investment Masters Chat
+# Investment Titans Chat
 
 A collaborative investment analysis platform powered by AI experts.
 
