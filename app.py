@@ -578,130 +578,68 @@ def main():
 {user_input}"""
 
         try:
-            # 创建占位符
-            response_placeholders = {}
-            for expert in sorted_experts:  # 使用排序后的专家列表
-                expert_color = st.session_state.expert_colors.get(
-                    expert.name, "#F0F0F0")
-                with st.chat_message(expert.name, avatar=expert.avatar):
-                    # 为每个专家创建一个占位符
-                    response_placeholders[expert.name] = st.empty()
-                    # 显示加载消息
-                    response_placeholders[expert.name].markdown(
-                        f"""
-                        <div style="background-color: {expert_color};" class="chat-message">
-                            <div class="expert-name">{expert.name}</div>
-                            <div class="divider"></div>
-                            <div class="thinking-animation">
-                                Thinking
-                                <div class="thinking-dots">
-                                    <span></span>
-                                    <span></span>
-                                    <span></span>
-                                </div>
-                            </div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
-
-            # 创建总结专家的占位符
-            with st.chat_message("Investment Masters", avatar=st.session_state.titans.avatar):
-                titans_placeholder = st.empty()
-                titans_placeholder.markdown(
-                    f"""
-                    <div style="background-color: #f6d365;" class="chat-message masters-message">
-                        <div class="expert-name">Investment Masters Summary</div>
-                        <div class="divider"></div>
-                        <div class="thinking-animation">
-                            Waiting for experts
-                            <div class="thinking-dots">
-                                <span></span>
-                                <span></span>
-                                <span></span>
-                            </div>
-                        </div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
-
-            # 异步获取和显示回答
-            responses = []
-            final_sorted_experts = sorted_experts  # 保存排序后的专家列表供异步函数使用
-
             # 创建新的事件循环
             async def run_async():
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 try:
-                    await process_responses(final_sorted_experts)  # 传入排序后的专家列表
+                    await process_responses(sorted_experts)
                 finally:
                     loop.close()
 
-            async def process_responses(sorted_experts):  # 接收排序后的专家列表作为参数
+            async def process_responses(sorted_experts):
+                """处理专家回应"""
                 responses = []
                 experts_responded = set()
+                placeholders = {}
 
-                # 使用排序后的专家列表
-                async for expert, response in get_responses_async(sorted_experts, prompt):
+                # 创建所有占位符（包括总结）
+                for expert in sorted_experts + [st.session_state.titans]:
                     expert_color = st.session_state.expert_colors.get(
                         expert.name, "#F0F0F0")
-                    # 更新对应专家的占位符
-                    response_placeholders[expert.name].markdown(
-                        f"""<div style="background-color: {expert_color};" class="chat-message">
-                            <div class="expert-name">{expert.name}</div>
-                            <div class="divider"></div>
-                            {response.replace('</div>', '').replace('<div>', '')}
-                        </div>""".strip(),
-                        unsafe_allow_html=True
-                    )
-                    add_auto_scroll()
+                    with st.chat_message(expert.name, avatar=expert.avatar):
+                        placeholders[expert.name] = st.empty()
+                        placeholders[expert.name].markdown(
+                            f"""<div style="background-color: {expert_color};" class="chat-message">
+                                <div class="expert-name">{expert.name}</div>
+                                <div class="divider"></div>
+                                <div class="thinking-animation">思考中...</div>
+                            </div>""",
+                            unsafe_allow_html=True
+                        )
 
-                    # 保存到会话状态
-                    st.session_state.messages.append({
-                        "role": expert.name,
-                        "content": response,
-                        "avatar": expert.avatar
-                    })
-                    responses.append(response)
-                    experts_responded.add(expert.name)
+                try:
+                    # 并发处理所有回应（包括总结）
+                    async for expert, response in get_responses_async(sorted_experts, prompt):
+                        expert_color = st.session_state.expert_colors.get(
+                            expert.name, "#F0F0F0")
 
-                    # 只有在所有专家都回答完后才生成总结
-                    if len(experts_responded) == len(sorted_experts):
-                        try:
-                            titans_response = await generate_summary(
-                                prompt,
-                                responses,
-                                sorted_experts  # 使用所有专家
-                            )
-                            titans_placeholder.markdown(
-                                f"""<div style="background-color: #f6d365;" class="chat-message masters-message">
-                                    <div class="expert-name">Investment Masters Summary</div>
+                        # 更新对应的占位符
+                        if expert.name in placeholders:
+                            placeholders[expert.name].markdown(
+                                f"""<div style="background-color: {expert_color};" class="chat-message">
+                                    <div class="expert-name">{expert.name}</div>
                                     <div class="divider"></div>
-                                    {titans_response.replace('</div>', '').replace('<div>', '')}
-                                </div>""".strip(),
-                                unsafe_allow_html=True
-                            )
-                            add_auto_scroll()
-                        except Exception as e:
-                            logger.error(f"生成总结时出错: {str(e)}")
-                            titans_placeholder.markdown(
-                                f"""
-                                <div style="background-color: #f6d365;" class="chat-message masters-message">
-                                    <div class="expert-name">Investment Masters Summary</div>
-                                    <div class="divider"></div>
-                                    <i>抱歉，生成总结时出现错误，请稍后再试。</i>
-                                </div>
-                                """,
+                                    {response.replace('</div>', '').replace('<div>', '')}
+                                </div>""",
                                 unsafe_allow_html=True
                             )
 
-            try:
-                asyncio.run(run_async())
-            except Exception as e:
-                st.error(f"处理请求时发生错误: {str(e)}")
-                logger.error(f"处理请求时发生错误: {str(e)}", exc_info=True)
+                        # 保存到会话状态
+                        st.session_state.messages.append({
+                            "role": expert.name,
+                            "content": response,
+                            "avatar": expert.avatar
+                        })
+
+                        add_auto_scroll()
+
+                except Exception as e:
+                    logger.error(f"处理回应时出错: {str(e)}")
+                    st.error(f"处理回应时出现错误: {str(e)}")
+
+            # 运行异步处理
+            asyncio.run(run_async())
 
         except Exception as e:
             st.error(f"处理请求时发生错误: {str(e)}")

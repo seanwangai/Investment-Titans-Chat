@@ -1,6 +1,7 @@
 from utils.quota import check_quota, use_quota, get_quota_display  # 使用新的函数名
 from openai import OpenAI
 from openai import APIError, APIConnectionError, RateLimitError, APITimeoutError
+from openai import AsyncOpenAI  # 改用异步客户端
 import logging
 import time
 import tiktoken
@@ -8,9 +9,16 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import streamlit as st
 import backoff  # 添加到导入列表
-from datetime import datetime
+from datetime import datetime, timedelta
 import sys
 import os
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type
+)
+import random
 
 # 添加项目根目录到 Python 路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -23,7 +31,7 @@ logging.basicConfig(
 )
 
 # X-AI API 配置
-client = OpenAI(
+client = AsyncOpenAI(  # 改用异步客户端
     api_key=st.secrets.get("XAI_API_KEY", ""),
     base_url=st.secrets.get("XAI_API_BASE", "https://api.x.ai/v1")
 )
@@ -93,25 +101,32 @@ def truncate_text(text, max_tokens):
 logger = logging.getLogger(__name__)
 
 
+# 添加请求限制管理
 class RateLimiter:
     def __init__(self, requests_per_second=1):
         self.requests_per_second = requests_per_second
-        self.last_request_time = 0
+        self.last_request_time = None
+        self._lock = None
 
-    def wait(self):
-        """等待直到可以发送下一个请求"""
-        current_time = time.time()
-        time_since_last_request = current_time - self.last_request_time
-        time_to_wait = (1.0 / self.requests_per_second) - \
-            time_since_last_request
+    @property
+    def lock(self):
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
-        if time_to_wait > 0:
-            time.sleep(time_to_wait)
+    async def acquire(self):
+        async with self.lock:
+            now = datetime.now()
+            if self.last_request_time is not None:
+                time_since_last = (
+                    now - self.last_request_time).total_seconds()
+                if time_since_last < 1/self.requests_per_second:
+                    wait_time = 1/self.requests_per_second - time_since_last
+                    await asyncio.sleep(wait_time)
+            self.last_request_time = datetime.now()
 
-        self.last_request_time = time.time()
 
-
-# 创建全局速率限制器
+# 创建全局限速器实例
 rate_limiter = RateLimiter(requests_per_second=1)
 
 
@@ -189,87 +204,92 @@ class ExpertAgent:
 
         self.adjust_knowledge_base()  # 重新调整知识库大小
 
-    # 定义重试装饰器
-    @backoff.on_exception(
-        backoff.expo,
-        (APIConnectionError, APITimeoutError),
-        max_tries=3,
-        max_time=30
+    # 修改装饰器
+    @retry(
+        retry=retry_if_exception_type(
+            (APIConnectionError, APITimeoutError, RateLimitError)),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        stop=stop_after_attempt(3)
     )
     async def get_response(self, prompt):
         """获取专家回应"""
         try:
             logger.info(f"开始处理专家 {self.name} 的回应")
-            logger.info(f"输入问题: {prompt[:100]}...")  # 只显示前100个字符
 
-            # 等待速率限制
-            rate_limiter.wait()
+            # 安全地获取当前模型
+            current_model = getattr(
+                st.session_state, 'current_model', 'grok-beta')
 
-            system_prompt = self.get_system_prompt()
-            system_tokens = self.count_tokens(system_prompt)
-            prompt_tokens = self.count_tokens(prompt)
+            if current_model in ["gemini-2.0-flash-exp", "gemini-1.5-flash"]:
+                from .gemini_handler import generate_gemini_response
+                expert_prompt = f"你现在扮演 {self.name}。请基于以下投资理念回答问题：\n\n{self.knowledge_base}\n\n问题：{prompt}"
+                logger.info(
+                    f"发送到 {current_model} 的提示词: {expert_prompt[:200]}...")
 
-            logger.info(f"{self.name} - Tokens统计：系统={system_tokens}, "
-                        f"问题={prompt_tokens}, 历史={self.history_tokens}")
+                # 在线程池中运行同步的 Gemini 请求
+                loop = asyncio.get_event_loop()
+                answer = await loop.run_in_executor(
+                    None,
+                    lambda: generate_gemini_response(
+                        expert_prompt, current_model)
+                )
+            else:
+                # 等待速率限制（只对 Grok 应用）
+                await rate_limiter.acquire()
 
-            response = client.chat.completions.create(
-                model="grok-beta",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.7
-            )
-
-            answer = response.choices[0].message.content
-            logger.info(f"{self.name} 的回应: {answer[:200]}...")  # 只显示前200个字符
+                # 直接调用 API，不使用 create_task
+                response = await client.chat.completions.create(
+                    model="grok-beta",
+                    messages=[
+                        {"role": "system", "content": self.get_system_prompt()},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.7
+                )
+                answer = response.choices[0].message.content
 
             self.update_chat_history(prompt, answer)
             return answer
 
         except Exception as e:
             logger.error(f"{self.name} 处理失败: {str(e)}")
-            raise e
+            raise
 
 
 async def get_responses_async(experts, prompt):
-    """异步获取所有专家的回应"""
-    logger.info(f"收到新问题: {prompt}")
-    logger.info(f"开始处理所有专家回应，专家数量: {len(experts)}")
-    total_experts = len(experts)
-    current_model = st.session_state.current_model
-
-    # 配额检查和日志记录（但不阻止请求）
-    quota_info = get_quota_display(current_model)
-    logger.info(f"当前配额状态: 剩余={quota_info['remaining']}, "
-                f"重置时间={quota_info['time_text']}")
+    start_time = time.time()
+    logger.info(f"开始并发处理所有专家回应，时间: {start_time}")
 
     async def get_expert_response(expert):
-        """获取单个专家的回应"""
         try:
-            logger.info(f"开始处理 {expert.name} 的回应...")
-            if current_model in ["gemini-2.0-flash-exp", "gemini-1.5-flash"]:
-                from .gemini_handler import generate_gemini_response
-                expert_prompt = f"你现在扮演 {expert.name}。请基于以下投资理念回答问题：\n\n{expert.knowledge_base}\n\n问题：{prompt}"
-                logger.info(
-                    f"发送到 {current_model} 的提示词: {expert_prompt[:200]}...")
-                response = await generate_gemini_response(expert_prompt, current_model)
-            else:
-                response = await expert.get_response(prompt)
-            return expert, response
+            response = await expert.get_response(prompt)
+            return expert, response, time.time()
         except Exception as e:
-            error_msg = f"专家 {expert.name} 处理失败: {str(e)}"
-            logger.error(error_msg)
-            logger.exception(e)
-            return expert, f"抱歉，生成回应时出现错误: {str(e)}"
+            logger.error(f"专家 {expert.name} 处理失败: {str(e)}")
+            return expert, f"抱歉，生成回应时出现错误: {str(e)}", time.time()
 
-    # 并发处理所有专家的请求
-    tasks = [get_expert_response(expert) for expert in experts]
-    responses = await asyncio.gather(*tasks)
+    # 创建所有任务并立即开始执行
+    tasks = [asyncio.create_task(get_expert_response(expert))
+             for expert in experts]
 
-    # 按原始顺序返回结果
-    for expert, response in responses:
+    # 使用 as_completed 按完成顺序获取结果
+    for response_task in asyncio.as_completed(tasks):
+        expert, response, finish_time = await response_task
+        logger.info(
+            f"专家 {expert.name} 响应完成，耗时: {finish_time - start_time:.2f}秒")
         yield expert, response
+
+    # 收集所有响应用于生成总结
+    all_responses = []
+    for task in tasks:
+        result = await task
+        all_responses.append(result)
+
+    responses = [resp for _, resp, _ in all_responses]
+
+    # 生成总结
+    summary = await generate_summary(prompt, responses, experts)
+    yield st.session_state.titans, summary
 
 
 async def generate_summary(prompt, responses, experts):
@@ -298,24 +318,18 @@ async def generate_summary(prompt, responses, experts):
     logger.info(f"生成总结的提示词: {summary_prompt[:200]}...")
 
     try:
-        summary_response = client.chat.completions.create(
+        # 使用异步 API 调用
+        summary_response = await client.chat.completions.create(
             model="grok-beta",
             messages=[{"role": "user", "content": summary_prompt}],
             temperature=0.7
         )
         summary = summary_response.choices[0].message.content
-
-#         logger.info(f"""
-# ==================== Investment Masters 总结 ====================
-# {summary}
-# ==========================================================
-# """)
-
         return summary
     except Exception as e:
         error_msg = "生成总结时出错"
         logger.error(error_msg)
-        logger.exception(e)  # 记录完整的错误堆栈
+        logger.exception(e)
         return "抱歉，无法生成总结。"
 
 __all__ = ['ExpertAgent', 'get_responses_async', 'generate_summary']
