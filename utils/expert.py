@@ -226,27 +226,41 @@ class ExpertAgent:
                 logger.info(
                     f"发送到 {current_model} 的提示词: {expert_prompt[:200]}...")
 
-                # 在线程池中运行同步的 Gemini 请求
-                loop = asyncio.get_event_loop()
-                answer = await loop.run_in_executor(
-                    None,
-                    lambda: generate_gemini_response(
-                        expert_prompt, current_model)
-                )
-            else:
-                # 等待速率限制（只对 Grok 应用）
-                await rate_limiter.acquire()
+                try:
+                    # 获取当前事件循环
+                    current_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    # 如果没有事件循环，创建一个新的
+                    current_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(current_loop)
 
-                # 直接调用 API，不使用 create_task
-                response = await client.chat.completions.create(
-                    model="grok-beta",
-                    messages=[
-                        {"role": "system", "content": self.get_system_prompt()},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.7
-                )
-                answer = response.choices[0].message.content
+                try:
+                    answer = await current_loop.run_in_executor(
+                        None,
+                        lambda: generate_gemini_response(
+                            expert_prompt, current_model)
+                    )
+                except Exception as e:
+                    logger.error(f"Gemini API 调用失败: {str(e)}")
+                    raise
+            else:
+                try:
+                    # 等待速率限制（只对 Grok 应用）
+                    await rate_limiter.acquire()
+
+                    # 直接调用 API，不使用 create_task
+                    response = await client.chat.completions.create(
+                        model="grok-beta",
+                        messages=[
+                            {"role": "system", "content": self.get_system_prompt()},
+                            {"role": "user", "content": prompt}
+                        ],
+                        temperature=0.7
+                    )
+                    answer = response.choices[0].message.content
+                except Exception as e:
+                    logger.error(f"Grok API 调用失败: {str(e)}")
+                    raise
 
             self.update_chat_history(prompt, answer)
             return answer
@@ -260,6 +274,14 @@ async def get_responses_async(experts, prompt):
     start_time = time.time()
     logger.info(f"开始并发处理所有专家回应，时间: {start_time}")
 
+    try:
+        # 获取当前事件循环
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # 如果没有事件循环，创建一个新的
+        current_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(current_loop)
+
     async def get_expert_response(expert):
         try:
             response = await expert.get_response(prompt)
@@ -268,28 +290,62 @@ async def get_responses_async(experts, prompt):
             logger.error(f"专家 {expert.name} 处理失败: {str(e)}")
             return expert, f"抱歉，生成回应时出现错误: {str(e)}", time.time()
 
-    # 创建所有任务并立即开始执行
-    tasks = [asyncio.create_task(get_expert_response(expert))
-             for expert in experts]
+    # 创建所有任务，确保使用当前事件循环
+    tasks = []
+    for expert in experts:
+        try:
+            task = current_loop.create_task(get_expert_response(expert))
+            tasks.append(task)
+        except Exception as e:
+            logger.error(f"创建任务失败: {str(e)}")
+            continue
 
-    # 使用 as_completed 按完成顺序获取结果
-    for response_task in asyncio.as_completed(tasks):
-        expert, response, finish_time = await response_task
-        logger.info(
-            f"专家 {expert.name} 响应完成，耗时: {finish_time - start_time:.2f}秒")
-        yield expert, response
+    if not tasks:
+        logger.error("没有成功创建任何任务")
+        return
 
-    # 收集所有响应用于生成总结
-    all_responses = []
-    for task in tasks:
-        result = await task
-        all_responses.append(result)
+    try:
+        # 使用 as_completed 按完成顺序获取结果
+        for response_task in asyncio.as_completed(tasks):
+            try:
+                expert, response, finish_time = await response_task
+                logger.info(
+                    f"专家 {expert.name} 响应完成，耗时: {finish_time - start_time:.2f}秒")
+                yield expert, response
+            except Exception as e:
+                logger.error(f"处理响应任务时出错: {str(e)}")
+                continue
 
-    responses = [resp for _, resp, _ in all_responses]
+        # 收集所有响应用于生成总结
+        all_responses = []
+        for task in tasks:
+            try:
+                if not task.done():
+                    result = await task
+                else:
+                    result = task.result()
+                all_responses.append(result)
+            except Exception as e:
+                logger.error(f"收集响应时出错: {str(e)}")
+                continue
 
-    # 生成总结
-    summary = await generate_summary(prompt, responses, experts)
-    yield st.session_state.titans, summary
+        if not all_responses:
+            logger.error("没有成功收集到任何响应")
+            return
+
+        responses = [resp for _, resp, _ in all_responses]
+
+        # 生成总结
+        try:
+            summary = await generate_summary(prompt, responses, experts)
+            yield st.session_state.titans, summary
+        except Exception as e:
+            logger.error(f"生成总结时出错: {str(e)}")
+            yield st.session_state.titans, "抱歉，生成总结时出现错误。"
+
+    except Exception as e:
+        logger.error(f"处理响应过程中出错: {str(e)}")
+        raise
 
 
 async def generate_summary(prompt, responses, experts):
